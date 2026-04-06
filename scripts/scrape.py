@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Scrapes secretfoodtours.com using Firecrawl, filters out blog pages and
-third-party tours, and generates a single-page knowledge base for CRM.
+third-party tours, and generates a mirror site structure for CRM knowledge source.
+Mirrors the original site: index -> city pages -> individual tour pages.
 """
 
 import json
@@ -20,9 +21,9 @@ SITEMAP_URL = f"{SITE_URL}/sitemap.xml"
 OUTPUT_DIR = Path("site")
 EXCLUDED_PATH_PATTERNS = ["/blog", "/world-tours"]
 THIRD_PARTY_MARKERS = ["iframe-body", "fareharbor", "rezdy", "classpop"]
+BASE_PATH = os.environ.get("BASE_PATH", "/kb-a7f3x9")
 MAX_WORKERS = 10
 
-# Lines containing these patterns are noise and should be removed
 NOISE_PATTERNS = [
     "Over 100,000 5 Star Reviews",
     "Also Recommended By",
@@ -57,6 +58,20 @@ FOOTER_START_MARKERS = [
     "Secret Food Tours is a registered",
 ]
 
+PAGE_STYLE = """
+    body { font-family: sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; line-height: 1.6; }
+    h1 { color: #333; border-bottom: 2px solid #c49959; padding-bottom: 10px; }
+    h2 { color: #c49959; margin-top: 30px; }
+    h3 { color: #555; }
+    a { color: #c49959; }
+    .tour-list { list-style: none; padding: 0; }
+    .tour-list li { padding: 8px 0; border-bottom: 1px solid #eee; }
+    .city-list { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
+    .city-list li { background: #f5f5f5; padding: 8px 16px; border-radius: 4px; }
+    small { color: #999; }
+    hr { border: none; border-top: 1px solid #eee; margin: 20px 0; }
+"""
+
 
 def fetch_sitemap_urls(sitemap_url: str) -> list[str]:
     import urllib.request
@@ -87,35 +102,21 @@ def is_excluded_path(url: str) -> bool:
     return any(path.startswith(pattern) for pattern in EXCLUDED_PATH_PATTERNS)
 
 
-def get_city_from_url(url: str) -> str | None:
-    """Extract city name from URL path like /paris/some-tour/ -> paris."""
-    path = urlparse(url).path.strip("/")
-    parts = path.split("/")
-    if len(parts) >= 1 and parts[0]:
-        return parts[0]
-    return None
-
-
-def is_tour_page(url: str) -> bool:
-    """Check if URL is a tour page (has city/tour-name pattern)."""
-    path = urlparse(url).path.strip("/")
-    parts = path.split("/")
-    return len(parts) >= 2
+def get_url_parts(url: str) -> list[str]:
+    """Get path parts from URL. e.g. /paris/le-marais/ -> ['paris', 'le-marais']"""
+    return [p for p in urlparse(url).path.strip("/").split("/") if p]
 
 
 def clean_markdown(md: str) -> str:
     """Strip navigation, footer, images, and other noise from markdown."""
     lines = md.split("\n")
 
-    # Find where footer starts
     content_end = len(lines)
     for i, line in enumerate(lines):
         if any(marker in line for marker in FOOTER_START_MARKERS):
             content_end = i
             break
 
-    # Find where nav ends — look for the last continent link, then find
-    # the first real heading after that
     nav_end = 0
     for i, line in enumerate(lines[:content_end]):
         if "South America" in line or "North America" in line:
@@ -130,20 +131,14 @@ def clean_markdown(md: str) -> str:
     cleaned = []
     for line in lines:
         stripped = line.strip()
-        # Skip noise lines
         if any(pattern in stripped for pattern in NOISE_PATTERNS):
             continue
-        # Skip image-only lines
         if re.match(r"^\s*!\[.*?\]\(.*?\)\s*$", line):
             continue
-        # Skip lines that are just links to images
         if re.match(r"^\s*\[!\[.*?\]\(.*?\)\]\(.*?\)\s*$", line):
             continue
-        # Remove inline images but keep surrounding text
         line = re.sub(r"!\[.*?\]\(.*?\)", "", line)
-        # Convert markdown links to just the text
         line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
-        # Skip junk
         stripped = line.strip()
         if stripped in ("×", "\\", "", "Home", "(5)", "Book Now", "Learn More",
                         "Book Now Learn More"):
@@ -151,7 +146,6 @@ def clean_markdown(md: str) -> str:
         cleaned.append(line)
 
     text = "\n".join(cleaned)
-    # Collapse multiple blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -170,17 +164,14 @@ def scrape_with_firecrawl(url: str) -> dict:
         raw_html = data.get("rawHtml", "")
         markdown = data.get("markdown", "")
 
-        # Check for third-party markers in raw HTML
         html_lower = raw_html.lower()
         if any(marker in html_lower for marker in THIRD_PARTY_MARKERS):
             return {"url": url, "status": "third_party"}
 
-        # Clean the markdown
         cleaned = clean_markdown(markdown)
         if len(cleaned) < 50:
             return {"url": url, "status": "no_content"}
 
-        # Extract title from markdown (first heading)
         title_match = re.search(r"^#+ (.+)$", cleaned, re.MULTILINE)
         title = title_match.group(1) if title_match else urlparse(url).path.strip("/")
 
@@ -219,80 +210,134 @@ def markdown_to_html(text: str) -> str:
     return "\n".join(processed)
 
 
-def generate_single_page(pages: list[dict]) -> str:
-    """Generate one single HTML page with all content organized by city."""
-    # Group pages by city
-    city_pages = defaultdict(list)
-    general_pages = []
+def escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
-    for page in pages:
-        city = get_city_from_url(page["url"])
-        if city and is_tour_page(page["url"]):
-            city_pages[city].append(page)
-        else:
-            general_pages.append(page)
 
-    # Build the HTML content
-    sections = []
-
-    # General/info pages first
-    if general_pages:
-        sections.append("<h2>General Information</h2>")
-        for page in sorted(general_pages, key=lambda x: x["title"]):
-            sections.append(f'<section id="{urlparse(page["url"]).path.strip("/").replace("/", "-")}">')
-            sections.append(f"<h3>{page['title']}</h3>")
-            # Remove the first heading from text since we already have it as h3
-            text = re.sub(r"^#+ .+\n*", "", page["text"], count=1).strip()
-            sections.append(markdown_to_html(text))
-            sections.append("</section>")
-            sections.append("<hr>")
-
-    # Tour pages grouped by city
-    for city in sorted(city_pages.keys()):
-        city_display = city.replace("-", " ").title()
-        sections.append(f'<h2 id="{city}">{city_display}</h2>')
-
-        for page in sorted(city_pages[city], key=lambda x: x["title"]):
-            slug = urlparse(page["url"]).path.strip("/").replace("/", "-")
-            sections.append(f'<section id="{slug}">')
-            sections.append(f"<h3>{page['title']}</h3>")
-            text = re.sub(r"^#+ .+\n*", "", page["text"], count=1).strip()
-            sections.append(markdown_to_html(text))
-            sections.append(f'<p><small>Source: <a href="{page["url"]}">{page["url"]}</a></small></p>')
-            sections.append("</section>")
-            sections.append("<hr>")
-
-    body = "\n".join(sections)
-
+def wrap_page(title: str, body: str, breadcrumb: str = "") -> str:
+    escaped_title = escape_html(title)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="robots" content="noindex, nofollow">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secret Food Tours - Complete Guide</title>
-    <style>
-        body {{ font-family: sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; line-height: 1.6; }}
-        h1 {{ color: #333; border-bottom: 2px solid #c49959; padding-bottom: 10px; }}
-        h2 {{ color: #c49959; margin-top: 40px; }}
-        h3 {{ color: #555; }}
-        section {{ margin-bottom: 30px; }}
-        hr {{ border: none; border-top: 1px solid #eee; margin: 20px 0; }}
-        a {{ color: #c49959; }}
-        small {{ color: #999; }}
-    </style>
+    <title>{escaped_title}</title>
+    <style>{PAGE_STYLE}</style>
 </head>
 <body>
-    <h1>Secret Food Tours - Complete Guide</h1>
-    <p>Secret Food Tours offers food tours, cooking classes, and unique culinary experiences
-    in over 110 cities worldwide. This page contains all tour information organized by city.</p>
+    {breadcrumb}
     {body}
 </body>
 </html>"""
 
 
+def generate_tour_page(page: dict) -> str:
+    """Generate an individual tour page."""
+    parts = get_url_parts(page["url"])
+    city = parts[0] if parts else ""
+    city_display = city.replace("-", " ").title()
+
+    breadcrumb = (
+        f'<p><a href="{BASE_PATH}/">Home</a> &gt; '
+        f'<a href="{BASE_PATH}/{city}/">{city_display}</a></p>'
+    )
+
+    text = page["text"]
+    # Remove first heading since we put it in <h1>
+    text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
+    body_html = markdown_to_html(text)
+
+    body = f"""
+    <h1>{escape_html(page['title'])}</h1>
+    {body_html}
+    <hr>
+    <p><small>Source: <a href="{page['url']}">{page['url']}</a></small></p>
+    """
+    return wrap_page(page["title"], body, breadcrumb)
+
+
+def generate_city_page(city: str, city_page: dict | None, tour_pages: list[dict]) -> str:
+    """Generate a city page with its overview and links to tours."""
+    city_display = city.replace("-", " ").title()
+
+    breadcrumb = f'<p><a href="{BASE_PATH}/">Home</a></p>'
+
+    sections = [f"<h1>{city_display} Food Tours</h1>"]
+
+    # City overview content if we have a city page
+    if city_page:
+        text = city_page["text"]
+        text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
+        sections.append(markdown_to_html(text))
+
+    # List of tours in this city
+    if tour_pages:
+        sections.append("<h2>Available Tours</h2>")
+        sections.append('<ul class="tour-list">')
+        for tp in sorted(tour_pages, key=lambda x: x["title"]):
+            parts = get_url_parts(tp["url"])
+            tour_slug = parts[1] if len(parts) >= 2 else ""
+            link = f"{BASE_PATH}/{city}/{tour_slug}/"
+            sections.append(f'<li><a href="{link}">{escape_html(tp["title"])}</a></li>')
+        sections.append("</ul>")
+
+    body = "\n".join(sections)
+    return wrap_page(f"{city_display} Food Tours", body, breadcrumb)
+
+
+def generate_index_page(cities: dict, general_pages: list[dict]) -> str:
+    """Generate the main index page with links to all cities."""
+    sections = [
+        "<h1>Secret Food Tours</h1>",
+        "<p>Secret Food Tours offers food tours, cooking classes, and unique culinary "
+        "experiences in over 110 cities worldwide.</p>",
+    ]
+
+    # City links
+    sections.append("<h2>Destinations</h2>")
+    sections.append('<ul class="city-list">')
+    for city in sorted(cities.keys()):
+        city_display = city.replace("-", " ").title()
+        count = len(cities[city]["tours"])
+        sections.append(
+            f'<li><a href="{BASE_PATH}/{city}/">{city_display}</a> ({count} tours)</li>'
+        )
+    sections.append("</ul>")
+
+    # General info pages
+    if general_pages:
+        sections.append("<h2>General Information</h2>")
+        sections.append('<ul class="tour-list">')
+        for page in sorted(general_pages, key=lambda x: x["title"]):
+            parts = get_url_parts(page["url"])
+            slug = parts[0] if parts else "info"
+            link = f"{BASE_PATH}/{slug}/"
+            sections.append(f'<li><a href="{link}">{escape_html(page["title"])}</a></li>')
+        sections.append("</ul>")
+
+    body = "\n".join(sections)
+    return wrap_page("Secret Food Tours", body)
+
+
+def generate_general_page(page: dict) -> str:
+    """Generate a general info page (not city/tour specific)."""
+    breadcrumb = f'<p><a href="{BASE_PATH}/">Home</a></p>'
+
+    text = page["text"]
+    text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
+    body_html = markdown_to_html(text)
+
+    body = f"""
+    <h1>{escape_html(page['title'])}</h1>
+    {body_html}
+    <hr>
+    <p><small>Source: <a href="{page['url']}">{page['url']}</a></small></p>
+    """
+    return wrap_page(page["title"], body, breadcrumb)
+
+
 def main():
-    # Check firecrawl is available
     try:
         subprocess.run(["firecrawl", "--version"], capture_output=True, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -342,15 +387,76 @@ def main():
                 errors += 1
                 print(f"[{done}/{total}] ERROR: {url} - {result.get('error', 'unknown')}", flush=True)
 
-    # Generate single page with all content
-    (OUTPUT_DIR / "index.html").write_text(generate_single_page(pages))
+    # Organize pages into structure: cities -> {city_page, tours}
+    cities = defaultdict(lambda: {"city_page": None, "tours": []})
+    general_pages = []
+
+    for page in pages:
+        parts = get_url_parts(page["url"])
+        if len(parts) == 0:
+            # Homepage - skip or treat as general
+            general_pages.append(page)
+        elif len(parts) == 1:
+            # Could be a city page (/paris/) or a general page (/privacy-policy/)
+            slug = parts[0]
+            # Check if any tour pages exist under this slug
+            has_tours = any(
+                get_url_parts(p["url"])[0] == slug
+                for p in pages
+                if len(get_url_parts(p["url"])) >= 2
+            )
+            if has_tours:
+                cities[slug]["city_page"] = page
+            else:
+                general_pages.append(page)
+        elif len(parts) >= 2:
+            # Tour page (/paris/le-marais-food-tour/)
+            city = parts[0]
+            cities[city]["tours"].append(page)
+
+    print(f"\nGenerating site structure...", flush=True)
+    print(f"  Cities: {len(cities)}", flush=True)
+    print(f"  General pages: {len(general_pages)}", flush=True)
+
+    # Write index page
+    (OUTPUT_DIR / "index.html").write_text(
+        generate_index_page(cities, general_pages)
+    )
+
+    # Write general pages
+    for page in general_pages:
+        parts = get_url_parts(page["url"])
+        slug = parts[0] if parts else "info"
+        page_dir = OUTPUT_DIR / slug
+        page_dir.mkdir(parents=True, exist_ok=True)
+        (page_dir / "index.html").write_text(generate_general_page(page))
+
+    # Write city pages and tour pages
+    for city, data in cities.items():
+        city_dir = OUTPUT_DIR / city
+        city_dir.mkdir(parents=True, exist_ok=True)
+
+        # City overview page
+        (city_dir / "index.html").write_text(
+            generate_city_page(city, data["city_page"], data["tours"])
+        )
+
+        # Individual tour pages
+        for tour in data["tours"]:
+            parts = get_url_parts(tour["url"])
+            if len(parts) >= 2:
+                tour_dir = city_dir / parts[1]
+                tour_dir.mkdir(parents=True, exist_ok=True)
+                (tour_dir / "index.html").write_text(generate_tour_page(tour))
 
     print(f"\n{'='*50}", flush=True)
     print(f"Scraped: {len(pages)} pages", flush=True)
     print(f"Skipped (third-party): {skipped_third_party}", flush=True)
     print(f"Skipped (no content): {skipped_no_content}", flush=True)
     print(f"Errors: {errors}", flush=True)
-    print(f"Output: {OUTPUT_DIR}/index.html (single page)", flush=True)
+    print(f"Output: {OUTPUT_DIR}/", flush=True)
+    print(f"  Index -> {len(cities)} city pages -> {sum(len(d['tours']) for d in cities.values())} tour pages", flush=True)
+    print(f"  + {len(general_pages)} general info pages", flush=True)
 
     if errors > len(urls) * 0.5:
         print("ERROR: Too many failures, something is wrong", flush=True)
