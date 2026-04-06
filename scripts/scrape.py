@@ -138,7 +138,19 @@ def clean_markdown(md: str) -> str:
         if re.match(r"^\s*\[!\[.*?\]\(.*?\)\]\(.*?\)\s*$", line):
             continue
         line = re.sub(r"!\[.*?\]\(.*?\)", "", line)
-        line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+        # Rewrite internal links to mirror site, strip external links
+        def rewrite_link(m):
+            text = m.group(1)
+            href = m.group(2)
+            if SITE_URL in href or href.startswith("/"):
+                # Internal link — rewrite to mirror
+                path = href.replace(SITE_URL, "")
+                if not path.startswith("/"):
+                    path = "/" + path
+                return f'[{text}]({BASE_PATH}{path})'
+            # External link — keep text only
+            return text
+        line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", rewrite_link, line)
         stripped = line.strip()
         if stripped in ("×", "\\", "", "Home", "(5)", "Book Now", "Learn More",
                         "Book Now Learn More"):
@@ -196,6 +208,8 @@ def markdown_to_html(text: str) -> str:
     html = re.sub(r"^# (.+)$", r"<h1>\1</h1>", html, flags=re.MULTILINE)
     html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html)
     html = re.sub(r"\*(.+?)\*", r"<em>\1</em>", html)
+    # Convert markdown links to HTML links
+    html = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', html)
 
     lines = html.split("\n")
     processed = []
@@ -287,27 +301,29 @@ def generate_city_page(city: str, city_page: dict | None, tour_pages: list[dict]
 
 
 def generate_index_page(cities: dict, general_pages: list[dict]) -> str:
-    """Generate the main index page with links to all cities."""
+    """Generate the main index page with links to all pages."""
     sections = [
         "<h1>Secret Food Tours</h1>",
         "<p>Secret Food Tours offers food tours, cooking classes, and unique culinary "
         "experiences in over 110 cities worldwide.</p>",
     ]
 
-    # City links
-    sections.append("<h2>Destinations</h2>")
-    sections.append('<ul class="city-list">')
-    for city in sorted(cities.keys()):
-        city_display = city.replace("-", " ").title()
-        count = len(cities[city]["tours"])
-        sections.append(
-            f'<li><a href="{BASE_PATH}/{city}/">{city_display}</a> ({count} tours)</li>'
-        )
-    sections.append("</ul>")
+    # Cities with tours
+    cities_with_tours = {k: v for k, v in cities.items() if v["tours"]}
+    if cities_with_tours:
+        sections.append("<h2>Destinations</h2>")
+        sections.append('<ul class="city-list">')
+        for city in sorted(cities_with_tours.keys()):
+            city_display = city.replace("-", " ").title()
+            count = len(cities_with_tours[city]["tours"])
+            sections.append(
+                f'<li><a href="{BASE_PATH}/{city}/">{city_display}</a> ({count} tours)</li>'
+            )
+        sections.append("</ul>")
 
-    # General info pages
+    # All other pages (countries, continents, info pages)
     if general_pages:
-        sections.append("<h2>General Information</h2>")
+        sections.append("<h2>More Information</h2>")
         sections.append('<ul class="tour-list">')
         for page in sorted(general_pages, key=lambda x: x["title"]):
             parts = get_url_parts(page["url"])
@@ -387,43 +403,38 @@ def main():
                 errors += 1
                 print(f"[{done}/{total}] ERROR: {url} - {result.get('error', 'unknown')}", flush=True)
 
-    # Organize pages into structure: cities -> {city_page, tours}
+    # Organize pages: group tour pages under their parent slug
     cities = defaultdict(lambda: {"city_page": None, "tours": []})
-    general_pages = []
+    top_level_pages = []  # All single-segment pages (cities, countries, continents, info)
 
     for page in pages:
         parts = get_url_parts(page["url"])
         if len(parts) == 0:
-            # Homepage - skip or treat as general
-            general_pages.append(page)
+            top_level_pages.append(page)
         elif len(parts) == 1:
-            # Could be a city page (/paris/) or a general page (/privacy-policy/)
-            slug = parts[0]
-            # Check if any tour pages exist under this slug
-            has_tours = any(
-                get_url_parts(p["url"])[0] == slug
-                for p in pages
-                if len(get_url_parts(p["url"])) >= 2
-            )
-            if has_tours:
-                cities[slug]["city_page"] = page
-            else:
-                general_pages.append(page)
+            top_level_pages.append(page)
+            # Also register as city page if tours exist under this slug
+            cities[parts[0]]["city_page"] = page
         elif len(parts) >= 2:
-            # Tour page (/paris/le-marais-food-tour/)
             city = parts[0]
             cities[city]["tours"].append(page)
 
-    print(f"\nGenerating site structure...", flush=True)
-    print(f"  Cities: {len(cities)}", flush=True)
-    print(f"  General pages: {len(general_pages)}", flush=True)
+    # Separate cities (have tours) from other top-level pages
+    city_slugs = {slug for slug, data in cities.items() if data["tours"]}
+    general_pages = [p for p in top_level_pages
+                     if get_url_parts(p["url"])[0] not in city_slugs
+                     if get_url_parts(p["url"])]
 
-    # Write index page
+    print(f"\nGenerating site structure...", flush=True)
+    print(f"  Cities with tours: {len(city_slugs)}", flush=True)
+    print(f"  Other pages: {len(general_pages)}", flush=True)
+
+    # Write index page — links to EVERYTHING
     (OUTPUT_DIR / "index.html").write_text(
         generate_index_page(cities, general_pages)
     )
 
-    # Write general pages
+    # Write all top-level pages (countries, continents, info, etc.)
     for page in general_pages:
         parts = get_url_parts(page["url"])
         slug = parts[0] if parts else "info"
@@ -433,6 +444,8 @@ def main():
 
     # Write city pages and tour pages
     for city, data in cities.items():
+        if not data["tours"]:
+            continue  # Already written as general page above
         city_dir = OUTPUT_DIR / city
         city_dir.mkdir(parents=True, exist_ok=True)
 
