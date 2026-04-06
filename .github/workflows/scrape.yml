@@ -2,9 +2,8 @@ name: Scrape and Deploy
 
 on:
   schedule:
-    # Run daily at 6:00 AM UTC
     - cron: "0 6 * * *"
-  workflow_dispatch: # Allow manual trigger
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,11 +29,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install firecrawl CLI
+        run: npm install -g firecrawl-cli
 
       - name: Scrape website
+        env:
+          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
         run: python scripts/scrape.py
+        timeout-minutes: 15
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

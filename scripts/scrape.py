@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Scrapes secretfoodtours.com, filters out blog pages and third-party tours,
-and generates a clean static site for use as a CRM knowledge source.
+Scrapes secretfoodtours.com using Firecrawl, filters out blog pages and
+third-party tours, and generates a clean static site for CRM knowledge source.
 """
 
+import json
 import os
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
-
-import requests
-from bs4 import BeautifulSoup
 
 SITE_URL = "https://www.secretfoodtours.com"
 SITEMAP_URL = f"{SITE_URL}/sitemap.xml"
@@ -21,16 +20,51 @@ OUTPUT_DIR = Path("site")
 EXCLUDED_PATH_PATTERNS = ["/blog", "/world-tours"]
 THIRD_PARTY_MARKERS = ["iframe-body", "fareharbor", "rezdy", "classpop"]
 BASE_PATH = os.environ.get("BASE_PATH", "/kb-a7f3x9")
-REQUEST_TIMEOUT = 10
 MAX_WORKERS = 10
+
+# Lines containing these patterns are noise and should be removed
+NOISE_PATTERNS = [
+    "Over 100,000 5 Star Reviews",
+    "Also Recommended By",
+    "Your browser does not support",
+    "SCROLL DOWN",
+    "Book Now Learn More",
+    "Our Cultural Tours",
+    "Book your Tour",
+    "BOOK YOUR TOUR",
+    "Our Top Recommendations For You",
+    "Book Now to Save on These Amazing Tours",
+    "Search Locations",
+    "Start typing destination",
+    "PRIVATE TOURS",
+    "GIFT CARDS",
+    "ABOUT US",
+    "CORPORATE TOURS",
+    "DESTINATIONS",
+    "Historical Tours",
+    "PRIVATE\\",
+    "Food Tour Drink Upgrade",
+    "Cooking Classes:",
+    "Food Tours:",
+    "Upgrades:",
+    "Upgrades",
+    "En Español",
+    "Faq Contact",
+]
+FOOTER_START_MARKERS = [
+    "Now In Over",
+    "## Join Our Newsletter",
+    "Secret Food Tours is a registered",
+]
 
 
 def fetch_sitemap_urls(sitemap_url: str) -> list[str]:
+    import urllib.request
     print(f"Fetching sitemap: {sitemap_url}", flush=True)
-    resp = requests.get(sitemap_url, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
+    with urllib.request.urlopen(sitemap_url, timeout=15) as resp:
+        content = resp.read()
 
-    root = ET.fromstring(resp.content)
+    root = ET.fromstring(content)
     ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
     sitemap_refs = root.findall("ns:sitemap/ns:loc", ns)
@@ -41,7 +75,6 @@ def fetch_sitemap_urls(sitemap_url: str) -> list[str]:
         return urls
 
     urls = [loc.text.strip() for loc in root.findall("ns:url/ns:loc", ns)]
-    # Sitemap may use web.secrettours.com which doesn't resolve externally
     urls = [u.replace("https://web.secrettours.com", SITE_URL) for u in urls]
     return urls
 
@@ -51,38 +84,97 @@ def is_excluded_path(url: str) -> bool:
     return any(path.startswith(pattern) for pattern in EXCLUDED_PATH_PATTERNS)
 
 
-def is_third_party_tour(html: str) -> bool:
-    html_lower = html.lower()
-    return any(marker in html_lower for marker in THIRD_PARTY_MARKERS)
+def clean_markdown(md: str) -> str:
+    """Strip navigation, footer, images, and other noise from markdown."""
+    lines = md.split("\n")
 
+    # Find where footer starts
+    content_end = len(lines)
+    for i, line in enumerate(lines):
+        if any(marker in line for marker in FOOTER_START_MARKERS):
+            content_end = i
+            break
 
-def extract_main_content(html: str, url: str) -> dict | None:
-    soup = BeautifulSoup(html, "html.parser")
+    # Find where nav ends — look for the last continent link, then find
+    # the first real heading after that
+    nav_end = 0
+    for i, line in enumerate(lines[:content_end]):
+        if "South America" in line or "North America" in line:
+            nav_end = i
+    content_start = nav_end
+    for i, line in enumerate(lines[nav_end:content_end]):
+        if re.match(r"^#{1,3}\s+.+", line) and not any(p in line for p in NOISE_PATTERNS):
+            content_start = nav_end + i
+            break
 
-    for tag in soup.find_all(["nav", "footer", "script", "style", "noscript", "iframe"]):
-        tag.decompose()
-    for tag in soup.find_all(class_=re.compile(r"cookie|popup|modal|newsletter|whatsapp", re.I)):
-        tag.decompose()
+    lines = lines[content_start:content_end]
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip noise lines
+        if any(pattern in stripped for pattern in NOISE_PATTERNS):
+            continue
+        # Skip image-only lines
+        if re.match(r"^\s*!\[.*?\]\(.*?\)\s*$", line):
+            continue
+        # Skip lines that are just links to images
+        if re.match(r"^\s*\[!\[.*?\]\(.*?\)\]\(.*?\)\s*$", line):
+            continue
+        # Remove inline images but keep surrounding text
+        line = re.sub(r"!\[.*?\]\(.*?\)", "", line)
+        # Convert markdown links to just the text
+        line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+        # Skip junk
+        stripped = line.strip()
+        if stripped in ("×", "\\", "", "Home", "(5)", "Book Now", "Learn More",
+                        "Book Now Learn More"):
+            continue
+        cleaned.append(line)
 
-    title_tag = soup.find("title")
-    title = title_tag.get_text(strip=True) if title_tag else url
-
-    meta_desc = soup.find("meta", attrs={"name": "description"})
-    description = meta_desc["content"] if meta_desc and meta_desc.get("content") else ""
-
-    main = soup.find("main") or soup.find("article") or soup.find(id="__next")
-    if not main:
-        main = soup.find("body")
-    if not main:
-        return None
-
-    text = main.get_text(separator="\n", strip=True)
+    text = "\n".join(cleaned)
+    # Collapse multiple blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-    if len(text.strip()) < 50:
-        return None
 
-    return {"title": title, "description": description, "text": text, "url": url}
+def scrape_with_firecrawl(url: str) -> dict:
+    """Scrape a URL using firecrawl CLI and return result."""
+    try:
+        result = subprocess.run(
+            ["firecrawl", "scrape", url, "--format", "markdown,rawHtml"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return {"url": url, "status": "error", "error": result.stderr[:200]}
+
+        data = json.loads(result.stdout)
+        raw_html = data.get("rawHtml", "")
+        markdown = data.get("markdown", "")
+
+        # Check for third-party markers in raw HTML
+        html_lower = raw_html.lower()
+        if any(marker in html_lower for marker in THIRD_PARTY_MARKERS):
+            return {"url": url, "status": "third_party"}
+
+        # Clean the markdown
+        cleaned = clean_markdown(markdown)
+        if len(cleaned) < 50:
+            return {"url": url, "status": "no_content"}
+
+        # Extract title from markdown (first heading)
+        title_match = re.search(r"^#+ (.+)$", cleaned, re.MULTILINE)
+        title = title_match.group(1) if title_match else urlparse(url).path.strip("/")
+
+        return {
+            "url": url,
+            "status": "ok",
+            "content": {"title": title, "text": cleaned, "url": url},
+        }
+
+    except subprocess.TimeoutExpired:
+        return {"url": url, "status": "error", "error": "timeout"}
+    except Exception as e:
+        return {"url": url, "status": "error", "error": str(e)}
 
 
 def url_to_filepath(url: str) -> Path:
@@ -93,11 +185,27 @@ def url_to_filepath(url: str) -> Path:
 
 
 def generate_page_html(content: dict) -> str:
-    escaped_title = content["title"].replace("<", "&lt;").replace(">", "&gt;")
-    escaped_desc = content["description"].replace("<", "&lt;").replace(">", "&gt;")
-    paragraphs = "\n".join(
-        f"<p>{line}</p>" for line in content["text"].split("\n") if line.strip()
-    )
+    escaped_title = content["title"].replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    # Convert markdown to simple HTML
+    text_html = content["text"]
+    # Convert headers
+    text_html = re.sub(r"^### (.+)$", r"<h3>\1</h3>", text_html, flags=re.MULTILINE)
+    text_html = re.sub(r"^## (.+)$", r"<h2>\1</h2>", text_html, flags=re.MULTILINE)
+    text_html = re.sub(r"^# (.+)$", r"<h1>\1</h1>", text_html, flags=re.MULTILINE)
+    # Convert bold
+    text_html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text_html)
+    # Wrap remaining lines in paragraphs
+    lines = text_html.split("\n")
+    processed = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("<h") or stripped.startswith("<ul") or stripped.startswith("<li"):
+            processed.append(stripped)
+        else:
+            processed.append(f"<p>{stripped}</p>")
+    body = "\n".join(processed)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -106,16 +214,14 @@ def generate_page_html(content: dict) -> str:
     <meta name="robots" content="noindex, nofollow">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{escaped_title}</title>
-    <meta name="description" content="{escaped_desc}">
     <style>
-        body {{ font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
-        h1 {{ color: #333; }}
+        body {{ font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6; }}
+        h1, h2, h3 {{ color: #333; }}
         a {{ color: #c49959; }}
     </style>
 </head>
 <body>
-    <h1>{escaped_title}</h1>
-    {paragraphs}
+    {body}
     <hr>
     <p><small>Source: <a href="{content['url']}">{content['url']}</a></small></p>
 </body>
@@ -148,32 +254,19 @@ def generate_index(pages: list[dict]) -> str:
 </html>"""
 
 
-def scrape_url(url: str) -> dict:
-    """Scrape a single URL. Returns a result dict."""
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        html = resp.text
-
-        if is_third_party_tour(html):
-            return {"url": url, "status": "third_party"}
-
-        content = extract_main_content(html, url)
-        if not content:
-            return {"url": url, "status": "no_content"}
-
-        return {"url": url, "status": "ok", "content": content}
-
-    except Exception as e:
-        return {"url": url, "status": "error", "error": str(e)}
-
-
 def main():
+    # Check firecrawl is available
+    try:
+        subprocess.run(["firecrawl", "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("ERROR: firecrawl CLI not found. Install with: npm install -g firecrawl-cli", flush=True)
+        sys.exit(1)
+
     all_urls = fetch_sitemap_urls(SITEMAP_URL)
     print(f"Found {len(all_urls)} URLs in sitemap", flush=True)
 
     urls = [u for u in all_urls if not is_excluded_path(u)]
-    print(f"After excluding blog paths: {len(urls)} URLs", flush=True)
+    print(f"After excluding paths: {len(urls)} URLs", flush=True)
 
     import shutil
     if OUTPUT_DIR.exists():
@@ -187,10 +280,10 @@ def main():
     skipped_no_content = 0
     errors = 0
 
-    print(f"Scraping with {MAX_WORKERS} parallel workers...", flush=True)
+    print(f"Scraping with {MAX_WORKERS} parallel workers via Firecrawl...", flush=True)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(scrape_url, url): url for url in urls}
+        futures = {executor.submit(scrape_with_firecrawl, url): url for url in urls}
         done = 0
         total = len(urls)
 
@@ -214,7 +307,7 @@ def main():
                 print(f"[{done}/{total}] SKIP (no content): {url}", flush=True)
             else:
                 errors += 1
-                print(f"[{done}/{total}] ERROR: {url} - {result['error']}", flush=True)
+                print(f"[{done}/{total}] ERROR: {url} - {result.get('error', 'unknown')}", flush=True)
 
     (OUTPUT_DIR / "index.html").write_text(generate_index(pages))
 
