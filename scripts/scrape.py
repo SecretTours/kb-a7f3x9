@@ -4,6 +4,7 @@ Scrapes secretfoodtours.com, filters out blog pages and third-party tours,
 and generates a clean static site for use as a CRM knowledge source.
 """
 
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -19,6 +20,7 @@ SITEMAP_URL = f"{SITE_URL}/sitemap.xml"
 OUTPUT_DIR = Path("site")
 EXCLUDED_PATH_PATTERNS = ["/blog", "/world-tours"]
 THIRD_PARTY_MARKERS = ["iframe-body", "fareharbor", "rezdy", "classpop"]
+BASE_PATH = os.environ.get("BASE_PATH", "/kb-a7f3x9")
 REQUEST_TIMEOUT = 10
 MAX_WORKERS = 10
 
@@ -122,7 +124,7 @@ def generate_page_html(content: dict) -> str:
 
 def generate_index(pages: list[dict]) -> str:
     links = "\n".join(
-        f'<li><a href="/{url_to_filepath(p["url"]).parent}/">{p["title"]}</a></li>'
+        f'<li><a href="{BASE_PATH}/{url_to_filepath(p["url"]).parent}/">{p["title"]}</a></li>'
         for p in sorted(pages, key=lambda x: x["url"])
     )
     return f"""<!DOCTYPE html>
