@@ -20,7 +20,7 @@ SITEMAP_URL = f"{SITE_URL}/sitemap.xml"
 OUTPUT_DIR = Path("site")
 EXCLUDED_PATH_PATTERNS = ["/blog"]
 THIRD_PARTY_MARKERS = ["iframe-body", "fareharbor", "rezdy", "classpop"]
-REQUEST_DELAY = 1  # seconds between requests to be polite
+REQUEST_DELAY = 0.3  # seconds between requests
 REQUEST_TIMEOUT = 30
 
 
