@@ -422,8 +422,8 @@ def main():
     # Separate cities (have tours) from other top-level pages
     city_slugs = {slug for slug, data in cities.items() if data["tours"]}
     general_pages = [p for p in top_level_pages
-                     if get_url_parts(p["url"])[0] not in city_slugs
-                     if get_url_parts(p["url"])]
+                     if get_url_parts(p["url"])
+                     and get_url_parts(p["url"])[0] not in city_slugs]
 
     print(f"\nGenerating site structure...", flush=True)
     print(f"  Cities with tours: {len(city_slugs)}", flush=True)
