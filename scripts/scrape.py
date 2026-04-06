@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 SITE_URL = "https://www.secretfoodtours.com"
 SITEMAP_URL = f"{SITE_URL}/sitemap.xml"
 OUTPUT_DIR = Path("site")
-EXCLUDED_PATH_PATTERNS = ["/blog"]
+EXCLUDED_PATH_PATTERNS = ["/blog", "/world-tours"]
 THIRD_PARTY_MARKERS = ["iframe-body", "fareharbor", "rezdy", "classpop"]
 REQUEST_TIMEOUT = 10
 MAX_WORKERS = 10
