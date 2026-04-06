@@ -38,7 +38,10 @@ def fetch_sitemap_urls(sitemap_url: str) -> list[str]:
             urls.extend(fetch_sitemap_urls(ref.text.strip()))
         return urls
 
-    return [loc.text.strip() for loc in root.findall("ns:url/ns:loc", ns)]
+    urls = [loc.text.strip() for loc in root.findall("ns:url/ns:loc", ns)]
+    # Sitemap may use web.secrettours.com which doesn't resolve externally
+    urls = [u.replace("https://web.secrettours.com", SITE_URL) for u in urls]
+    return urls
 
 
 def is_excluded_path(url: str) -> bool:
