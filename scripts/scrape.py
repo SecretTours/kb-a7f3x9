@@ -61,7 +61,10 @@ FOOTER_START_MARKERS = [
 def fetch_sitemap_urls(sitemap_url: str) -> list[str]:
     import urllib.request
     print(f"Fetching sitemap: {sitemap_url}", flush=True)
-    with urllib.request.urlopen(sitemap_url, timeout=15) as resp:
+    req = urllib.request.Request(sitemap_url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; KnowledgeBaseBot/1.0)"
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
         content = resp.read()
 
     root = ET.fromstring(content)
