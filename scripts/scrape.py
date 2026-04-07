@@ -176,12 +176,13 @@ def scrape_with_firecrawl(url: str) -> dict:
             r'https://www\.secretfoodtours\.com/[a-zA-Z][a-zA-Z0-9\-/]*/',
             markdown
         ))
-        # Filter out non-page URLs
+        # Filter out non-page URLs and excluded paths
         internal_links = {
             link for link in internal_links
             if "/_next/" not in link
             and "/uploads/" not in link
             and link.rstrip("/") != url.rstrip("/")
+            and not is_excluded_path(urlparse(link).path)
         }
 
         cleaned = clean_markdown(markdown)
