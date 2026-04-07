@@ -133,24 +133,15 @@ def clean_markdown(md: str) -> str:
         stripped = line.strip()
         if any(pattern in stripped for pattern in NOISE_PATTERNS):
             continue
-        if re.match(r"^\s*!\[.*?\]\(.*?\)\s*$", line):
-            continue
-        if re.match(r"^\s*\[!\[.*?\]\(.*?\)\]\(.*?\)\s*$", line):
-            continue
+        # For image-links like [![alt](img)](url), extract just the URL as a link
+        line = re.sub(
+            r'\[!\[[^\]]*\]\([^)]*\)\]\(([^)]+)\)',
+            lambda m: f'[Link]({m.group(1)})' if SITE_URL in m.group(1) else '',
+            line
+        )
+        # Remove standalone images
         line = re.sub(r"!\[.*?\]\(.*?\)", "", line)
-        # Rewrite internal links to mirror site, strip external links
-        def rewrite_link(m):
-            text = m.group(1)
-            href = m.group(2)
-            if SITE_URL in href or href.startswith("/"):
-                # Internal link — rewrite to mirror
-                path = href.replace(SITE_URL, "")
-                if not path.startswith("/"):
-                    path = "/" + path
-                return f'[{text}]({BASE_PATH}{path})'
-            # External link — keep text only
-            return text
-        line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", rewrite_link, line)
+        # Keep markdown links (will be converted to HTML links later)
         stripped = line.strip()
         if stripped in ("×", "\\", "", "Home", "(5)", "Book Now", "Learn More",
                         "Book Now Learn More"):
@@ -180,6 +171,19 @@ def scrape_with_firecrawl(url: str) -> dict:
         if any(marker in html_lower for marker in THIRD_PARTY_MARKERS):
             return {"url": url, "status": "third_party"}
 
+        # Extract all internal page links from raw markdown before cleaning
+        internal_links = set(re.findall(
+            r'https://www\.secretfoodtours\.com/[a-zA-Z][a-zA-Z0-9\-/]*/',
+            markdown
+        ))
+        # Filter out non-page URLs
+        internal_links = {
+            link for link in internal_links
+            if "/_next/" not in link
+            and "/uploads/" not in link
+            and link.rstrip("/") != url.rstrip("/")
+        }
+
         cleaned = clean_markdown(markdown)
         if len(cleaned) < 50:
             return {"url": url, "status": "no_content"}
@@ -190,7 +194,12 @@ def scrape_with_firecrawl(url: str) -> dict:
         return {
             "url": url,
             "status": "ok",
-            "content": {"title": title, "text": cleaned, "url": url},
+            "content": {
+                "title": title,
+                "text": cleaned,
+                "url": url,
+                "internal_links": sorted(internal_links),
+            },
         }
 
     except subprocess.TimeoutExpired:
@@ -224,13 +233,23 @@ def markdown_to_html(text: str) -> str:
     return "\n".join(processed)
 
 
+def rewrite_urls(html: str) -> str:
+    """Replace all original site URLs with mirror URLs in final HTML."""
+    # Rewrite internal links to mirror
+    html = html.replace(SITE_URL + "/", BASE_PATH + "/")
+    html = html.replace(SITE_URL, BASE_PATH + "/")
+    # Also handle image CDN URLs — just remove them
+    html = re.sub(r'https://prod\.secretfoodtours\.com/[^"\'>\s]*', '', html)
+    return html
+
+
 def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
 def wrap_page(title: str, body: str, breadcrumb: str = "") -> str:
     escaped_title = escape_html(title)
-    return f"""<!DOCTYPE html>
+    page_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -244,6 +263,19 @@ def wrap_page(title: str, body: str, breadcrumb: str = "") -> str:
     {body}
 </body>
 </html>"""
+    return rewrite_urls(page_html)
+
+
+def generate_links_section(links: list[str]) -> str:
+    """Generate HTML for internal links found in the page."""
+    if not links:
+        return ""
+    items = []
+    for link in links:
+        path = link.replace(SITE_URL, "")
+        display = path.strip("/").replace("-", " ").replace("/", " - ").title()
+        items.append(f'<li><a href="{BASE_PATH}{path}">{display}</a></li>')
+    return f'<h2>Related Pages</h2>\n<ul class="tour-list">\n' + "\n".join(items) + "\n</ul>"
 
 
 def generate_tour_page(page: dict) -> str:
@@ -258,13 +290,14 @@ def generate_tour_page(page: dict) -> str:
     )
 
     text = page["text"]
-    # Remove first heading since we put it in <h1>
     text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
     body_html = markdown_to_html(text)
+    links_html = generate_links_section(page.get("internal_links", []))
 
     body = f"""
     <h1>{escape_html(page['title'])}</h1>
     {body_html}
+    {links_html}
     <hr>
     <p><small>Source: <a href="{page['url']}">{page['url']}</a></small></p>
     """
@@ -337,16 +370,18 @@ def generate_index_page(cities: dict, general_pages: list[dict]) -> str:
 
 
 def generate_general_page(page: dict) -> str:
-    """Generate a general info page (not city/tour specific)."""
+    """Generate a general info page (countries, continents, info)."""
     breadcrumb = f'<p><a href="{BASE_PATH}/">Home</a></p>'
 
     text = page["text"]
     text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
     body_html = markdown_to_html(text)
+    links_html = generate_links_section(page.get("internal_links", []))
 
     body = f"""
     <h1>{escape_html(page['title'])}</h1>
     {body_html}
+    {links_html}
     <hr>
     <p><small>Source: <a href="{page['url']}">{page['url']}</a></small></p>
     """
