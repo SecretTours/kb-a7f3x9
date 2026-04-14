@@ -69,13 +69,26 @@ def th_fetch_all_data() -> dict:
     """
     print("Fetching TicketingHub data...", flush=True)
 
-    products = th_api_get("products")
-    if not products:
-        print("  WARNING: Could not fetch TH products", flush=True)
-        return {}
+    # Paginate through all products (API returns max 400 per request)
+    products = []
+    offset = 0
+    while True:
+        if offset == 0:
+            batch = th_api_get("products?limit=400")
+        else:
+            batch = th_api_get(f"products?limit=400&offset={offset}")
+        if not batch or not isinstance(batch, list):
+            if offset == 0:
+                print("  WARNING: Could not fetch TH products", flush=True)
+                return {}
+            break
+        products.extend(batch)
+        if len(batch) < 400:
+            break
+        offset += 400
 
-    active = [p for p in products if p.get("deleted_at") is None]
-    print(f"  Found {len(active)} active products", flush=True)
+    active = [p for p in products if isinstance(p, dict) and p.get("deleted_at") is None]
+    print(f"  Found {len(active)} active products (from {len(products)} total)", flush=True)
 
     result = {}
     for p in active:
