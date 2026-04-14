@@ -28,7 +28,7 @@ OUTPUT_DIR = Path("site")
 EXCLUDED_PATH_PATTERNS = ["/blog", "/world-tours"]
 THIRD_PARTY_MARKERS = ["iframe-body", "fareharbor", "rezdy", "classpop"]
 BASE_PATH = os.environ.get("BASE_PATH", "/kb-a7f3x9")
-MAX_WORKERS = 10
+MAX_WORKERS = 5  # Keep low to avoid Firecrawl rate limits
 
 # TicketingHub Supplier API
 TH_API_BASE = "https://api.ticketinghub.com/supplier/v1"
@@ -581,60 +581,69 @@ def clean_markdown(md: str) -> str:
     return text.strip()
 
 
-def scrape_with_firecrawl(url: str) -> dict:
-    """Scrape a URL using firecrawl CLI and return result."""
-    try:
-        result = subprocess.run(
-            ["firecrawl", "scrape", url, "--format", "markdown,rawHtml"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            return {"url": url, "status": "error", "error": result.stderr[:200]}
+def scrape_with_firecrawl(url: str, max_retries: int = 3) -> dict:
+    """Scrape a URL using firecrawl CLI and return result. Retries on rate limits."""
+    import time
+    for attempt in range(max_retries):
+        try:
+            result = subprocess.run(
+                ["firecrawl", "scrape", url, "--format", "markdown,rawHtml"],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0:
+                error_text = result.stderr[:300] + result.stdout[:300]
+                if "rate limit" in error_text.lower() or "429" in error_text:
+                    wait = 10 * (attempt + 1)
+                    print(f"  Rate limited, waiting {wait}s (attempt {attempt+1}/{max_retries})", flush=True)
+                    time.sleep(wait)
+                    continue
+                return {"url": url, "status": "error", "error": error_text[:200]}
 
-        data = json.loads(result.stdout)
-        raw_html = data.get("rawHtml", "")
-        markdown = data.get("markdown", "")
+            data = json.loads(result.stdout)
+            raw_html = data.get("rawHtml", "")
+            markdown = data.get("markdown", "")
 
-        html_lower = raw_html.lower()
-        if any(marker in html_lower for marker in THIRD_PARTY_MARKERS):
-            return {"url": url, "status": "third_party"}
+            html_lower = raw_html.lower()
+            if any(marker in html_lower for marker in THIRD_PARTY_MARKERS):
+                return {"url": url, "status": "third_party"}
 
-        # Extract all internal page links from raw markdown before cleaning
-        internal_links = set(re.findall(
-            r'https://www\.secretfoodtours\.com/[a-zA-Z][a-zA-Z0-9\-/]*/',
-            markdown
-        ))
-        # Filter out non-page URLs and excluded paths
-        internal_links = {
-            link for link in internal_links
-            if "/_next/" not in link
-            and "/uploads/" not in link
-            and link.rstrip("/") != url.rstrip("/")
-            and not is_excluded_path(urlparse(link).path)
-        }
+            # Extract all internal page links from raw markdown before cleaning
+            internal_links = set(re.findall(
+                r'https://www\.secretfoodtours\.com/[a-zA-Z][a-zA-Z0-9\-/]*/',
+                markdown
+            ))
+            internal_links = {
+                link for link in internal_links
+                if "/_next/" not in link
+                and "/uploads/" not in link
+                and link.rstrip("/") != url.rstrip("/")
+                and not is_excluded_path(urlparse(link).path)
+            }
 
-        cleaned = clean_markdown(markdown)
-        if len(cleaned) < 50:
-            return {"url": url, "status": "no_content"}
+            cleaned = clean_markdown(markdown)
+            if len(cleaned) < 50:
+                return {"url": url, "status": "no_content"}
 
-        title_match = re.search(r"^#+ (.+)$", cleaned, re.MULTILINE)
-        title = title_match.group(1) if title_match else urlparse(url).path.strip("/")
+            title_match = re.search(r"^#+ (.+)$", cleaned, re.MULTILINE)
+            title = title_match.group(1) if title_match else urlparse(url).path.strip("/")
 
-        return {
-            "url": url,
-            "status": "ok",
-            "content": {
-                "title": title,
-                "text": cleaned,
+            return {
                 "url": url,
-                "internal_links": sorted(internal_links),
-            },
-        }
+                "status": "ok",
+                "content": {
+                    "title": title,
+                    "text": cleaned,
+                    "url": url,
+                    "internal_links": sorted(internal_links),
+                },
+            }
 
-    except subprocess.TimeoutExpired:
-        return {"url": url, "status": "error", "error": "timeout"}
-    except Exception as e:
-        return {"url": url, "status": "error", "error": str(e)}
+        except subprocess.TimeoutExpired:
+            return {"url": url, "status": "error", "error": "timeout"}
+        except Exception as e:
+            return {"url": url, "status": "error", "error": str(e)}
+
+    return {"url": url, "status": "error", "error": "max retries exceeded (rate limited)"}
 
 
 def markdown_to_html(text: str) -> str:
