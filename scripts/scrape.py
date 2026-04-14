@@ -733,15 +733,23 @@ def generate_links_section(links: list) -> str:
 
 # Generic titles that should be replaced with a URL-derived name
 GENERIC_TITLES = {
-    "what you'll do", "what you'll do", "lo que harás", "lo que haras",
+    "what you'll do", "what you\u2019ll do", "lo que harás", "lo que haras",
     "about the tour", "sobre el tour", "meet the best",
+    "see itinerary", "book your tour", "book now", "faq",
+    "frequently asked questions", "ready to taste",
 }
 
 
 def derive_tour_title(page_title: str, url: str) -> str:
     """Return a proper tour title. If the scraped title is generic (e.g.
     'What you'll do'), derive one from the URL slug instead."""
-    if page_title.lower().strip() not in GENERIC_TITLES:
+    title_lower = page_title.lower().strip()
+    is_generic = (
+        title_lower in GENERIC_TITLES
+        or any(title_lower.startswith(g) for g in GENERIC_TITLES)
+        or len(page_title.strip()) < 5
+    )
+    if not is_generic:
         return page_title
 
     parts = get_url_parts(url)
