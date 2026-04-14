@@ -430,6 +430,14 @@ FOOTER_START_MARKERS = [
     "## Join Our Newsletter",
     "Secret Food Tours is a registered",
 ]
+# Sections that contain duplicate/cross-linked tour content to strip
+SECTION_CUT_MARKERS = [
+    "Other Secret Tours",
+    "Other Secret Food Tours",
+    "See Our Other",
+    "Nuestros otros tours",
+    "Ver nuestros otros",
+]
 
 PAGE_STYLE = """
     body { font-family: sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; line-height: 1.6; }
@@ -487,6 +495,12 @@ def clean_markdown(md: str) -> str:
     content_end = len(lines)
     for i, line in enumerate(lines):
         if any(marker in line for marker in FOOTER_START_MARKERS):
+            content_end = i
+            break
+
+    # Also cut at "Other Secret Tours" sections (duplicate/cross-linked content)
+    for i, line in enumerate(lines[:content_end]):
+        if any(marker in line for marker in SECTION_CUT_MARKERS):
             content_end = i
             break
 
@@ -680,6 +694,11 @@ def generate_tour_page(page: dict, th_data: dict = None) -> str:
 
     text = page["text"]
     text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
+    # Strip "Other Secret Tours" sections (duplicate/cross-linked content)
+    for marker in SECTION_CUT_MARKERS:
+        idx = text.find(marker)
+        if idx > 0:
+            text = text[:idx].strip()
     body_html = markdown_to_html(text)
     links_html = generate_links_section(page.get("internal_links", []))
 
@@ -788,6 +807,10 @@ def generate_general_page(page: dict) -> str:
 
     text = page["text"]
     text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
+    for marker in SECTION_CUT_MARKERS:
+        idx = text.find(marker)
+        if idx > 0:
+            text = text[:idx].strip()
     body_html = markdown_to_html(text)
     links_html = generate_links_section(page.get("internal_links", []))
 
