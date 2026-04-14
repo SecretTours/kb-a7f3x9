@@ -33,7 +33,7 @@ MAX_WORKERS = 10
 # TicketingHub Supplier API
 TH_API_BASE = "https://api.ticketinghub.com/supplier/v1"
 TH_TOKEN = os.environ.get("TH_TOKEN", "at~qqj0cWVTnNV-vG6hb7Bpzw")
-TH_AVAIL_DAYS = 14  # How many days of availability to fetch
+TH_AVAIL_DAYS = 60  # How many days of availability to fetch (2 months)
 
 ############################
 # TicketingHub Integration #
@@ -98,11 +98,23 @@ def th_fetch_all_data() -> dict:
                 for t in tiers
             ]
 
-    # Fetch availability for all products at once
-    today = datetime.now().strftime("%Y-%m-%d")
-    end_date = (datetime.now() + timedelta(days=TH_AVAIL_DAYS)).strftime("%Y-%m-%d")
-    avail_data = th_api_get(f"availability?from={today}&to={end_date}")
+    # Fetch availability in 30-day chunks (API max is 31 days per request)
+    today = datetime.now()
+    all_avail_data = {}
+    days_remaining = TH_AVAIL_DAYS
+    chunk_start = today
+    while days_remaining > 0:
+        chunk_days = min(days_remaining, 30)
+        chunk_end = chunk_start + timedelta(days=chunk_days)
+        from_str = chunk_start.strftime("%Y-%m-%d")
+        to_str = chunk_end.strftime("%Y-%m-%d")
+        chunk_data = th_api_get(f"availability?from={from_str}&to={to_str}")
+        if chunk_data:
+            all_avail_data.update(chunk_data)
+        chunk_start = chunk_end + timedelta(days=1)
+        days_remaining -= chunk_days + 1
 
+    avail_data = all_avail_data
     if avail_data:
         for date_str, date_entries in avail_data.items():
             for pid, info in date_entries.items():
@@ -345,7 +357,7 @@ def generate_availability_html(product: dict) -> str:
         for tier in product["tiers"]:
             sections.append(
                 f'<tr style="border-bottom:1px solid #eee;">'
-                f'<td style="padding:6px;">{escape_html(tier["name"])}</td>'
+                f'<td style="padding:6px;">{escape_html(translate_tier_name(tier["name"]))}</td>'
                 f'<td style="text-align:right;padding:6px;">{escape_html(tier["price"])}</td>'
                 f'</tr>'
             )
@@ -395,6 +407,22 @@ def generate_availability_html(product: dict) -> str:
                        'Please contact us or visit the booking page for dates.</em></p>')
 
     return "\n".join(sections)
+
+
+# Translate Spanish tier names to English for display
+TIER_NAME_TRANSLATIONS = {
+    "adulto": "Adult",
+    "adultos": "Adult",
+    "juventud": "Youth",
+    "niños": "Child",
+    "niño": "Child",
+    "adolescente": "Teen",
+}
+
+
+def translate_tier_name(name: str) -> str:
+    """Translate Spanish tier names to English."""
+    return TIER_NAME_TRANSLATIONS.get(name.lower().strip(), name)
 
 
 NOISE_PATTERNS = [
@@ -681,11 +709,40 @@ def generate_links_section(links: list) -> str:
     return f'<h2>Related Pages</h2>\n<ul class="tour-list">\n' + "\n".join(items) + "\n</ul>"
 
 
+# Generic titles that should be replaced with a URL-derived name
+GENERIC_TITLES = {
+    "what you'll do", "what you'll do", "lo que harás", "lo que haras",
+    "about the tour", "sobre el tour", "meet the best",
+}
+
+
+def derive_tour_title(page_title: str, url: str) -> str:
+    """Return a proper tour title. If the scraped title is generic (e.g.
+    'What you'll do'), derive one from the URL slug instead."""
+    if page_title.lower().strip() not in GENERIC_TITLES:
+        return page_title
+
+    parts = get_url_parts(url)
+    if len(parts) >= 2:
+        city = parts[0].replace("-", " ").title()
+        tour = parts[1].replace("-", " ").title()
+        # Remove city name from tour slug if it's repeated
+        if tour.lower().startswith(city.lower()):
+            tour = tour[len(city):].strip(" -")
+        if tour:
+            return f"Secret Food Tours: {city} - {tour}"
+        return f"Secret Food Tours: {city}"
+    return page_title
+
+
 def generate_tour_page(page: dict, th_data: dict = None) -> str:
     """Generate an individual tour page with optional TicketingHub data."""
     parts = get_url_parts(page["url"])
     city = parts[0] if parts else ""
     city_display = city.replace("-", " ").title()
+
+    # Use a proper title instead of generic "What you'll do"
+    title = derive_tour_title(page["title"], page["url"])
 
     breadcrumb = (
         f'<p><a href="{BASE_PATH}/">Home</a> &gt; '
@@ -705,7 +762,7 @@ def generate_tour_page(page: dict, th_data: dict = None) -> str:
     # TicketingHub: pricing, availability, and booking link
     th_html = ""
     if th_data:
-        matched_pid = match_tour_to_product(page["url"], page["title"], th_data)
+        matched_pid = match_tour_to_product(page["url"], title, th_data)
         if matched_pid:
             product = th_data[matched_pid]
             th_html = generate_availability_html(product)
@@ -713,7 +770,6 @@ def generate_tour_page(page: dict, th_data: dict = None) -> str:
             print(f"    TH match: /{url_path}/ -> {product['name']}", flush=True)
 
     # Booking link (always add, pointing to the real tour page with #BOOKING anchor)
-    # Use data-external to prevent URL rewriting
     booking_url = page["url"].rstrip("/") + "/#BOOKING"
     booking_html = (
         f'<hr>\n'
@@ -725,15 +781,15 @@ def generate_tour_page(page: dict, th_data: dict = None) -> str:
     )
 
     body = f"""
-    <h1>{escape_html(page['title'])}</h1>
+    <h1>{escape_html(title)}</h1>
     {body_html}
-    {links_html}
     {th_html}
     {booking_html}
     <hr>
     <p><small>Source: <a href="{page['url']}">{page['url']}</a></small></p>
+    {links_html}
     """
-    return wrap_page(page["title"], body, breadcrumb)
+    return wrap_page(title, body, breadcrumb)
 
 
 def generate_city_page(city: str, city_page: dict, tour_pages: list) -> str:
