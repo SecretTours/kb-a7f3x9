@@ -1,4 +1,4 @@
-name: Scrape and Deploy
+name: Full Scrape and Deploy (daily)
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -37,12 +37,20 @@ jobs:
       - name: Install firecrawl CLI
         run: npm install -g firecrawl-cli
 
-      - name: Scrape website
+      - name: Full scrape + generate
         env:
           FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
           TH_TOKEN: ${{ secrets.TH_TOKEN }}
         run: python scripts/scrape.py
         timeout-minutes: 15
+
+      - name: Save page cache for hourly refreshes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f scraped_pages.json
+          git diff --cached --quiet || git commit -m "Update scraped pages cache [skip ci]"
+          git push
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
