@@ -40,6 +40,7 @@ jobs:
       - name: Scrape website
         env:
           FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+          TH_TOKEN: ${{ secrets.TH_TOKEN }}
         run: python scripts/scrape.py
         timeout-minutes: 15
 

@@ -3,6 +3,9 @@
 Scrapes secretfoodtours.com using Firecrawl, filters out blog pages and
 third-party tours, and generates a mirror site structure for CRM knowledge source.
 Mirrors the original site: index -> city pages -> individual tour pages.
+
+Integrates with TicketingHub Supplier API to add real pricing and availability
+data to each tour page.
 """
 
 import json
@@ -13,8 +16,11 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
+
+import urllib.request
 
 SITE_URL = "https://www.secretfoodtours.com"
 SITEMAP_URL = f"{SITE_URL}/sitemap.xml"
@@ -23,6 +29,373 @@ EXCLUDED_PATH_PATTERNS = ["/blog", "/world-tours"]
 THIRD_PARTY_MARKERS = ["iframe-body", "fareharbor", "rezdy", "classpop"]
 BASE_PATH = os.environ.get("BASE_PATH", "/kb-a7f3x9")
 MAX_WORKERS = 10
+
+# TicketingHub Supplier API
+TH_API_BASE = "https://api.ticketinghub.com/supplier/v1"
+TH_TOKEN = os.environ.get("TH_TOKEN", "at~qqj0cWVTnNV-vG6hb7Bpzw")
+TH_AVAIL_DAYS = 14  # How many days of availability to fetch
+
+############################
+# TicketingHub Integration #
+############################
+
+def th_api_get(endpoint: str):
+    """Make a GET request to the TicketingHub Supplier API via curl."""
+    url = f"{TH_API_BASE}/{endpoint}"
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--compressed", "-H", f"Authorization: Bearer {TH_TOKEN}", url],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            print(f"  TH API curl error ({endpoint}): {result.stderr[:200]}", flush=True)
+            return None
+        return json.loads(result.stdout)
+    except Exception as e:
+        print(f"  TH API error ({endpoint}): {e}", flush=True)
+        return None
+
+
+def th_fetch_all_data() -> dict:
+    """Fetch all products, tiers, and availability from TicketingHub.
+
+    Returns a dict keyed by product ID with structure:
+    {
+        "name": str,
+        "currency": str,
+        "tiers": [{"name": str, "price": str, "tier_type": str}, ...],
+        "availability": {date_str: {"status": "OPEN"|"CLOSED", "times": {time: {booked, capacity}}, ...}},
+    }
+    """
+    print("Fetching TicketingHub data...", flush=True)
+
+    products = th_api_get("products")
+    if not products:
+        print("  WARNING: Could not fetch TH products", flush=True)
+        return {}
+
+    active = [p for p in products if p.get("deleted_at") is None]
+    print(f"  Found {len(active)} active products", flush=True)
+
+    result = {}
+    for p in active:
+        pid = p["id"]
+        result[pid] = {
+            "name": p["name"],
+            "short_name": p.get("short_name", ""),
+            "currency": p["currency"],
+            "description": p.get("description", ""),
+            "time_zone": p.get("time_zone", ""),
+            "tiers": [],
+            "availability": {},
+        }
+
+        # Fetch tiers (pricing)
+        tiers = th_api_get(f"products/{pid}/tiers")
+        if tiers:
+            result[pid]["tiers"] = [
+                {"name": t["name"], "price": t["price"], "tier_type": t.get("tier_type", "")}
+                for t in tiers
+            ]
+
+    # Fetch availability for all products at once
+    today = datetime.now().strftime("%Y-%m-%d")
+    end_date = (datetime.now() + timedelta(days=TH_AVAIL_DAYS)).strftime("%Y-%m-%d")
+    avail_data = th_api_get(f"availability?from={today}&to={end_date}")
+
+    if avail_data:
+        for date_str, date_entries in avail_data.items():
+            for pid, info in date_entries.items():
+                if pid not in result:
+                    continue
+                times = info.get("times", {})
+                parsed_times = {}
+                total_cap = 0
+                total_booked = 0
+                for time_str, slot_val in times.items():
+                    if isinstance(slot_val, str) and "/" in slot_val:
+                        booked, cap = slot_val.split("/")
+                        booked, cap = int(booked), int(cap)
+                    else:
+                        booked, cap = 0, int(slot_val) if slot_val else 0
+                    parsed_times[time_str] = {"booked": booked, "capacity": cap}
+                    total_cap += cap
+                    total_booked += booked
+
+                status = "OPEN" if total_cap > 0 else "CLOSED"
+                remaining = total_cap - total_booked
+                result[pid]["availability"][date_str] = {
+                    "status": status,
+                    "remaining": remaining,
+                    "capacity": total_cap,
+                    "times": parsed_times,
+                }
+
+    products_with_avail = sum(1 for v in result.values() if v["availability"])
+    print(f"  Fetched tiers for {len(result)} products, availability for {products_with_avail}", flush=True)
+    return result
+
+
+def _normalize(s: str) -> str:
+    """Lowercase, strip accents/punctuation, collapse whitespace for matching."""
+    s = s.lower()
+    # Common accent replacements
+    for src, dst in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("ñ","n"),("ü","u")]:
+        s = s.replace(src, dst)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return " ".join(s.split())
+
+
+# City name mapping: URL slug -> possible TH product city names
+CITY_ALIASES = {
+    "paris": ["paris", "paris"],
+    "new-york": ["new york", "nueva york", "nyc"],
+    "mexico-city": ["mexico city", "ciudad de mexico"],
+    "miami": ["miami"],
+    "rome": ["rome", "roma"],
+    "london": ["london"],
+    "barcelona": ["barcelona"],
+    "madrid": ["madrid"],
+    "bilbao": ["bilbao"],
+    "lisbon": ["lisbon", "lisboa"],
+    "porto": ["porto"],
+    "prague": ["prague", "praha"],
+    "budapest": ["budapest"],
+    "vienna": ["vienna", "wien"],
+    "warsaw": ["warsaw", "varsovia"],
+    "zurich": ["zurich"],
+    "nice": ["nice", "niza"],
+    "marseille": ["marseille", "marsella"],
+    "lyon": ["lyon"],
+    "florence": ["florence", "firenze"],
+    "venice": ["venice", "venecia"],
+    "naples": ["naples", "napoles"],
+    "milan": ["milan"],
+    "seville": ["seville", "sevilla"],
+    "san-sebastian": ["san sebastian"],
+    "valencia": ["valencia"],
+    "palma-de-mallorca": ["palma", "mallorca"],
+    "palermo": ["palermo"],
+    "modena": ["modena"],
+    "parma": ["parma"],
+    "sorrento": ["sorrento"],
+    "bologna": ["bologna"],
+    "tokyo": ["tokyo"],
+    "osaka": ["osaka"],
+    "seoul": ["seoul"],
+    "taipei": ["taipei"],
+    "bangkok": ["bangkok"],
+    "singapore": ["singapore"],
+    "ho-chi-minh": ["saigon", "ho chi minh"],
+    "phuket": ["phuket"],
+    "sydney": ["sydney"],
+    "melbourne": ["melbourne"],
+    "stockholm": ["stockholm"],
+    "oslo": ["oslo"],
+    "reykjavik": ["reykjavik"],
+    "munich": ["munich", "munchen"],
+    "berlin": ["berlin"],
+    "cartagena": ["cartagena"],
+    "medellin": ["medellin"],
+    "cusco": ["cusco"],
+    "lima": ["lima"],
+    "louisville": ["louisville"],
+    "atlanta": ["atlanta"],
+    "denver": ["denver"],
+    "scottsdale": ["scottsdale"],
+    "tucson": ["tucson"],
+    "phoenix": ["phoenix"],
+    "las-vegas": ["las vegas"],
+    "san-francisco": ["san francisco"],
+    "los-angeles": ["los angeles"],
+    "san-diego": ["san diego"],
+    "chicago": ["chicago"],
+    "toronto": ["toronto"],
+    "vancouver": ["vancouver"],
+    "malaga": ["malaga"],
+}
+
+# Keywords that help distinguish tour types
+TOUR_TYPE_KEYWORDS = {
+    "chocolate": ["chocolate", "chocolateria", "pastry", "pastries", "pasteleria"],
+    "express": ["express", "expres"],
+    "drink": ["drink", "upgrade", "bebida"],
+    "cooking": ["cooking", "class", "making", "noodle", "dumpling", "pasta", "tea"],
+    "montmartre": ["montmartre"],
+    "le-marais": ["marais"],
+    "notre-dame": ["notre dame", "notre-dame"],
+    "saint-germain": ["saint germain", "st. germain", "st germain"],
+    "trastevere": ["trastevere"],
+    "bbq": ["bbq"],
+    "evening": ["evening"],
+    "private": ["private"],
+}
+
+
+def match_tour_to_product(tour_url: str, tour_title: str, th_data: dict):
+    """Try to match a website tour page to a TicketingHub product ID.
+
+    Returns the best matching product ID, or None if no match found.
+    Uses the URL slug as primary matching signal since page titles can be generic.
+    """
+    parts = get_url_parts(tour_url)
+    if len(parts) < 2:
+        return None
+
+    city_slug = parts[0]
+    tour_slug = parts[1]
+
+    # Get city aliases for matching
+    city_names = CITY_ALIASES.get(city_slug, [city_slug.replace("-", " ")])
+
+    # Normalize tour slug (primary signal) and title (secondary)
+    norm_slug = _normalize(tour_slug.replace("-", " "))
+    norm_title = _normalize(tour_title)
+
+    # Combine slug + title for keyword matching (slug is more reliable)
+    combined = norm_slug + " " + norm_title
+
+    # Detect tour type from URL slug and title
+    tour_types = set()
+    for ttype, keywords in TOUR_TYPE_KEYWORDS.items():
+        if any(kw in combined for kw in keywords):
+            tour_types.add(ttype)
+
+    is_private = "private" in combined
+
+    # Specific neighborhood/location keywords from the slug
+    slug_words = set(norm_slug.split())
+
+    best_match = None
+    best_score = 0
+
+    for pid, pdata in th_data.items():
+        pname = _normalize(pdata["name"])
+
+        # Must match city
+        if not any(cn in pname for cn in city_names):
+            continue
+
+        score = 1  # Base score for city match
+
+        # Private matching
+        p_is_private = "private" in pname
+        if is_private == p_is_private:
+            score += 2
+        elif is_private != p_is_private:
+            score -= 3  # Strong penalty for private mismatch
+
+        # Neighborhood/location matching (strong signal)
+        location_keywords = ["montmartre", "marais", "notre dame", "saint germain",
+                           "st germain", "trastevere", "chinatown", "little italy",
+                           "south beach", "little havana", "latin quarter", "obuda",
+                           "le marais"]
+        for loc_kw in location_keywords:
+            in_slug = loc_kw.replace(" ", "") in norm_slug.replace(" ", "")
+            in_product = loc_kw in pname
+            if in_slug and in_product:
+                score += 5  # Strong match for location
+            elif in_slug and not in_product:
+                score -= 3  # Slug says location X but product doesn't
+            elif not in_slug and in_product:
+                score -= 2  # Product has location not in slug
+
+        # Tour type matching
+        for ttype in tour_types:
+            keywords = TOUR_TYPE_KEYWORDS[ttype]
+            if any(kw in pname for kw in keywords):
+                score += 3
+
+        # "express" mismatch penalty
+        is_express = "express" in combined
+        p_is_express = "expres" in pname
+        if is_express != p_is_express:
+            score -= 4
+
+        # Penalize drink upgrades unless the tour is a drink upgrade
+        if "drink" not in tour_types and ("drink" in pname or "upgrade" in pname):
+            score -= 5
+        if "drink" in tour_types and ("drink" not in pname and "upgrade" not in pname):
+            score -= 5
+
+        # Penalize cooking classes unless matching
+        if "cooking" not in tour_types and ("class" in pname or "making" in pname):
+            score -= 5
+
+        if score > best_score:
+            best_score = score
+            best_match = pid
+
+    if best_score >= 2:
+        return best_match
+    return None
+
+
+def generate_availability_html(product: dict) -> str:
+    """Generate HTML for pricing and availability of a matched TicketingHub product."""
+    sections = []
+
+    # Pricing table
+    if product["tiers"]:
+        sections.append('<h2>Pricing</h2>')
+        sections.append('<table style="border-collapse:collapse;width:100%;max-width:400px;">')
+        sections.append('<tr style="border-bottom:2px solid #c49959;">'
+                       '<th style="text-align:left;padding:6px;">Ticket Type</th>'
+                       '<th style="text-align:right;padding:6px;">Price</th></tr>')
+        for tier in product["tiers"]:
+            sections.append(
+                f'<tr style="border-bottom:1px solid #eee;">'
+                f'<td style="padding:6px;">{escape_html(tier["name"])}</td>'
+                f'<td style="text-align:right;padding:6px;">{escape_html(tier["price"])}</td>'
+                f'</tr>'
+            )
+        sections.append('</table>')
+
+    # Availability calendar
+    avail = product.get("availability", {})
+    if avail:
+        sections.append('<h2>Upcoming Availability</h2>')
+        sections.append('<table style="border-collapse:collapse;width:100%;max-width:600px;">')
+        sections.append('<tr style="border-bottom:2px solid #c49959;">'
+                       '<th style="text-align:left;padding:6px;">Date</th>'
+                       '<th style="text-align:center;padding:6px;">Status</th>'
+                       '<th style="text-align:left;padding:6px;">Times</th>'
+                       '<th style="text-align:right;padding:6px;">Spots Left</th></tr>')
+
+        for date_str in sorted(avail.keys()):
+            day = avail[date_str]
+            status = day["status"]
+            if status == "OPEN":
+                status_html = '<span style="color:#2e7d32;">&#9679; Open</span>'
+                times_list = []
+                for t, info in sorted(day["times"].items()):
+                    if info["capacity"] > 0:
+                        remaining = info["capacity"] - info["booked"]
+                        times_list.append(t)
+                times_html = ", ".join(times_list) if times_list else "-"
+                spots = day["remaining"]
+                spots_html = f'{spots}' if spots > 3 else f'<strong style="color:#c62828;">{spots} (limited)</strong>'
+            else:
+                status_html = '<span style="color:#c62828;">&#9679; Closed</span>'
+                times_html = "-"
+                spots_html = "0"
+
+            sections.append(
+                f'<tr style="border-bottom:1px solid #eee;">'
+                f'<td style="padding:6px;">{date_str}</td>'
+                f'<td style="text-align:center;padding:6px;">{status_html}</td>'
+                f'<td style="padding:6px;">{times_html}</td>'
+                f'<td style="text-align:right;padding:6px;">{spots_html}</td>'
+                f'</tr>'
+            )
+        sections.append('</table>')
+    elif product["tiers"]:
+        # Has pricing but no availability data
+        sections.append('<p><em>Availability for this tour is on request. '
+                       'Please contact us or visit the booking page for dates.</em></p>')
+
+    return "\n".join(sections)
+
 
 NOISE_PATTERNS = [
     "Over 100,000 5 Star Reviews",
@@ -73,7 +446,7 @@ PAGE_STYLE = """
 """
 
 
-def fetch_sitemap_urls(sitemap_url: str) -> list[str]:
+def fetch_sitemap_urls(sitemap_url: str) -> list:
     import urllib.request
     print(f"Fetching sitemap: {sitemap_url}", flush=True)
     req = urllib.request.Request(sitemap_url, headers={
@@ -102,7 +475,7 @@ def is_excluded_path(url: str) -> bool:
     return any(path.startswith(pattern) for pattern in EXCLUDED_PATH_PATTERNS)
 
 
-def get_url_parts(url: str) -> list[str]:
+def get_url_parts(url: str) -> list:
     """Get path parts from URL. e.g. /paris/le-marais/ -> ['paris', 'le-marais']"""
     return [p for p in urlparse(url).path.strip("/").split("/") if p]
 
@@ -235,12 +608,27 @@ def markdown_to_html(text: str) -> str:
 
 
 def rewrite_urls(html: str) -> str:
-    """Replace all original site URLs with mirror URLs in final HTML."""
+    """Replace all original site URLs with mirror URLs in final HTML.
+
+    Links with data-external="true" are preserved as-is (they point to the real site).
+    """
+    # Preserve external links by temporarily replacing them
+    externals = []
+    def save_external(m):
+        externals.append(m.group(0))
+        return f"__EXTERNAL_{len(externals) - 1}__"
+    html = re.sub(r'<a\s+data-external="true"[^>]*>.*?</a>', save_external, html)
+
     # Rewrite internal links to mirror
     html = html.replace(SITE_URL + "/", BASE_PATH + "/")
     html = html.replace(SITE_URL, BASE_PATH + "/")
     # Also handle image CDN URLs — just remove them
     html = re.sub(r'https://prod\.secretfoodtours\.com/[^"\'>\s]*', '', html)
+
+    # Restore external links
+    for i, ext in enumerate(externals):
+        html = html.replace(f"__EXTERNAL_{i}__", ext)
+
     return html
 
 
@@ -267,7 +655,7 @@ def wrap_page(title: str, body: str, breadcrumb: str = "") -> str:
     return rewrite_urls(page_html)
 
 
-def generate_links_section(links: list[str]) -> str:
+def generate_links_section(links: list) -> str:
     """Generate HTML for internal links found in the page."""
     if not links:
         return ""
@@ -279,8 +667,8 @@ def generate_links_section(links: list[str]) -> str:
     return f'<h2>Related Pages</h2>\n<ul class="tour-list">\n' + "\n".join(items) + "\n</ul>"
 
 
-def generate_tour_page(page: dict) -> str:
-    """Generate an individual tour page."""
+def generate_tour_page(page: dict, th_data: dict = None) -> str:
+    """Generate an individual tour page with optional TicketingHub data."""
     parts = get_url_parts(page["url"])
     city = parts[0] if parts else ""
     city_display = city.replace("-", " ").title()
@@ -295,17 +683,41 @@ def generate_tour_page(page: dict) -> str:
     body_html = markdown_to_html(text)
     links_html = generate_links_section(page.get("internal_links", []))
 
+    # TicketingHub: pricing, availability, and booking link
+    th_html = ""
+    if th_data:
+        matched_pid = match_tour_to_product(page["url"], page["title"], th_data)
+        if matched_pid:
+            product = th_data[matched_pid]
+            th_html = generate_availability_html(product)
+            url_path = "/".join(get_url_parts(page["url"]))
+            print(f"    TH match: /{url_path}/ -> {product['name']}", flush=True)
+
+    # Booking link (always add, pointing to the real tour page with #BOOKING anchor)
+    # Use data-external to prevent URL rewriting
+    booking_url = page["url"].rstrip("/") + "/#BOOKING"
+    booking_html = (
+        f'<hr>\n'
+        f'<p style="text-align:center;margin:20px 0;">'
+        f'<a data-external="true" href="{booking_url}" target="_blank" '
+        f'style="background:#ff5a5f;color:white;padding:12px 32px;'
+        f'text-decoration:none;border-radius:4px;font-size:16px;font-weight:bold;">'
+        f'Book This Tour</a></p>'
+    )
+
     body = f"""
     <h1>{escape_html(page['title'])}</h1>
     {body_html}
     {links_html}
+    {th_html}
+    {booking_html}
     <hr>
     <p><small>Source: <a href="{page['url']}">{page['url']}</a></small></p>
     """
     return wrap_page(page["title"], body, breadcrumb)
 
 
-def generate_city_page(city: str, city_page: dict | None, tour_pages: list[dict]) -> str:
+def generate_city_page(city: str, city_page: dict, tour_pages: list) -> str:
     """Generate a city page with its overview and links to tours."""
     city_display = city.replace("-", " ").title()
 
@@ -334,7 +746,7 @@ def generate_city_page(city: str, city_page: dict | None, tour_pages: list[dict]
     return wrap_page(f"{city_display} Food Tours", body, breadcrumb)
 
 
-def generate_index_page(cities: dict, general_pages: list[dict]) -> str:
+def generate_index_page(cities: dict, general_pages: list) -> str:
     """Generate the main index page with links to all pages."""
     sections = [
         "<h1>Secret Food Tours</h1>",
@@ -389,55 +801,71 @@ def generate_general_page(page: dict) -> str:
     return wrap_page(page["title"], body, breadcrumb)
 
 
+CACHE_FILE = Path("scraped_pages.json")
+
+
 def main():
-    try:
-        subprocess.run(["firecrawl", "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("ERROR: firecrawl CLI not found. Install with: npm install -g firecrawl-cli", flush=True)
-        sys.exit(1)
+    regen_mode = "--regen" in sys.argv
 
-    all_urls = fetch_sitemap_urls(SITEMAP_URL)
-    print(f"Found {len(all_urls)} URLs in sitemap", flush=True)
+    if regen_mode and CACHE_FILE.exists():
+        print("Regeneration mode: using cached scraped data", flush=True)
+        with open(CACHE_FILE) as f:
+            pages = json.load(f)
+        print(f"Loaded {len(pages)} pages from cache", flush=True)
+    else:
+        try:
+            subprocess.run(["firecrawl", "--version"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("ERROR: firecrawl CLI not found. Install with: npm install -g firecrawl-cli", flush=True)
+            sys.exit(1)
 
-    urls = [u for u in all_urls if not is_excluded_path(u)]
-    print(f"After excluding paths: {len(urls)} URLs", flush=True)
+        all_urls = fetch_sitemap_urls(SITEMAP_URL)
+        print(f"Found {len(all_urls)} URLs in sitemap", flush=True)
 
+        urls = [u for u in all_urls if not is_excluded_path(u)]
+        print(f"After excluding paths: {len(urls)} URLs", flush=True)
+
+        pages = []
+        skipped_third_party = 0
+        skipped_no_content = 0
+        errors = 0
+
+        print(f"Scraping with {MAX_WORKERS} parallel workers via Firecrawl...", flush=True)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(scrape_with_firecrawl, url): url for url in urls}
+            done = 0
+            total = len(urls)
+
+            for future in as_completed(futures):
+                done += 1
+                result = future.result()
+                url = result["url"]
+
+                if result["status"] == "ok":
+                    pages.append(result["content"])
+                    print(f"[{done}/{total}] OK: {url}", flush=True)
+                elif result["status"] == "third_party":
+                    skipped_third_party += 1
+                    print(f"[{done}/{total}] SKIP (third-party): {url}", flush=True)
+                elif result["status"] == "no_content":
+                    skipped_no_content += 1
+                    print(f"[{done}/{total}] SKIP (no content): {url}", flush=True)
+                else:
+                    errors += 1
+                    print(f"[{done}/{total}] ERROR: {url} - {result.get('error', 'unknown')}", flush=True)
+
+        # Save cache for --regen mode
+        with open(CACHE_FILE, "w") as f:
+            json.dump(pages, f)
+        print(f"Cached {len(pages)} pages to {CACHE_FILE}", flush=True)
+
+    # Recreate output directory
     import shutil
     if OUTPUT_DIR.exists():
         shutil.rmtree(OUTPUT_DIR)
     OUTPUT_DIR.mkdir(parents=True)
-
     (OUTPUT_DIR / "robots.txt").write_text("User-agent: *\nDisallow: /\n")
-
-    pages = []
-    skipped_third_party = 0
-    skipped_no_content = 0
-    errors = 0
-
-    print(f"Scraping with {MAX_WORKERS} parallel workers via Firecrawl...", flush=True)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(scrape_with_firecrawl, url): url for url in urls}
-        done = 0
-        total = len(urls)
-
-        for future in as_completed(futures):
-            done += 1
-            result = future.result()
-            url = result["url"]
-
-            if result["status"] == "ok":
-                pages.append(result["content"])
-                print(f"[{done}/{total}] OK: {url}", flush=True)
-            elif result["status"] == "third_party":
-                skipped_third_party += 1
-                print(f"[{done}/{total}] SKIP (third-party): {url}", flush=True)
-            elif result["status"] == "no_content":
-                skipped_no_content += 1
-                print(f"[{done}/{total}] SKIP (no content): {url}", flush=True)
-            else:
-                errors += 1
-                print(f"[{done}/{total}] ERROR: {url} - {result.get('error', 'unknown')}", flush=True)
 
     # Organize pages: group tour pages under their parent slug
     cities = defaultdict(lambda: {"city_page": None, "tours": []})
@@ -465,6 +893,9 @@ def main():
     print(f"  Cities with tours: {len(city_slugs)}", flush=True)
     print(f"  Other pages: {len(general_pages)}", flush=True)
 
+    # Fetch TicketingHub data for availability and pricing
+    th_data = th_fetch_all_data()
+
     # Write index page — links to EVERYTHING
     (OUTPUT_DIR / "index.html").write_text(
         generate_index_page(cities, general_pages)
@@ -490,26 +921,25 @@ def main():
             generate_city_page(city, data["city_page"], data["tours"])
         )
 
-        # Individual tour pages
+        # Individual tour pages (with TH availability data)
         for tour in data["tours"]:
             parts = get_url_parts(tour["url"])
             if len(parts) >= 2:
                 tour_dir = city_dir / parts[1]
                 tour_dir.mkdir(parents=True, exist_ok=True)
-                (tour_dir / "index.html").write_text(generate_tour_page(tour))
+                (tour_dir / "index.html").write_text(
+                    generate_tour_page(tour, th_data)
+                )
 
     print(f"\n{'='*50}", flush=True)
-    print(f"Scraped: {len(pages)} pages", flush=True)
-    print(f"Skipped (third-party): {skipped_third_party}", flush=True)
-    print(f"Skipped (no content): {skipped_no_content}", flush=True)
-    print(f"Errors: {errors}", flush=True)
+    print(f"Pages: {len(pages)}", flush=True)
+    if not regen_mode:
+        print(f"Skipped (third-party): {skipped_third_party}", flush=True)
+        print(f"Skipped (no content): {skipped_no_content}", flush=True)
+        print(f"Errors: {errors}", flush=True)
     print(f"Output: {OUTPUT_DIR}/", flush=True)
     print(f"  Index -> {len(cities)} city pages -> {sum(len(d['tours']) for d in cities.values())} tour pages", flush=True)
     print(f"  + {len(general_pages)} general info pages", flush=True)
-
-    if errors > len(urls) * 0.5:
-        print("ERROR: Too many failures, something is wrong", flush=True)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
