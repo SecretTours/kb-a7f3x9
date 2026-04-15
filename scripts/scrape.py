@@ -506,6 +506,21 @@ SECTION_CUT_MARKERS = [
     "Ver nuestros otros",
 ]
 
+# Extra markers for city pages — cut everything after the intro description
+CITY_CUT_MARKERS = [
+    "Select Your Adventure",
+    "Selecciona Tu Aventura",
+    "Choose your",
+    "Walking Food Tours",
+    "Photos of",
+    "PHOTOS OF",
+    "Photo of",
+    "Reviews from",
+    "The Tour Guides Take Care",
+    "LOS GUÍAS TURÍSTICOS SE ENCARGAN",
+    "THE TOUR GUIDES TAKE CARE",
+]
+
 PAGE_STYLE = """
     body { font-family: sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; line-height: 1.6; }
     h1 { color: #333; border-bottom: 2px solid #c49959; padding-bottom: 10px; }
@@ -855,13 +870,48 @@ def generate_city_page(city: str, city_page: dict, tour_pages: list) -> str:
     # City overview content if we have a city page
     if city_page:
         text = city_page["text"]
-        text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
-        # Strip everything after known section markers to keep it short
-        for marker in SECTION_CUT_MARKERS:
+        # Remove all markdown headers
+        text = re.sub(r"^#+ .+$", "", text, flags=re.MULTILINE).strip()
+        # Remove breadcrumb-like lines
+        text = re.sub(r"^\[Home\]\([^)]*\)\s*$", "", text, flags=re.MULTILINE).strip()
+        # Remove standalone city name lines (breadcrumb remnants)
+        text = re.sub(r"^" + re.escape(city_display) + r"\s*$", "", text, flags=re.MULTILINE).strip()
+        # Cut at city-specific markers (tour cards, reviews, photos, etc.)
+        for marker in SECTION_CUT_MARKERS + CITY_CUT_MARKERS:
             idx = text.find(marker)
-            if idx > 0:
+            if idx >= 0:
                 text = text[:idx].strip()
-        sections.append(markdown_to_html(text))
+        # Remove markdown links but keep their text
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        # Remove lines that look like ratings, prices, or tour card junk
+        cleaned_lines = []
+        for line in text.split("\n"):
+            line_s = line.strip()
+            if not line_s:
+                continue
+            # Skip rating lines like "(4.95)", price lines like "$104.99" / "£82.99"
+            if re.match(r"^\(\d+\.\d+\)$", line_s):
+                continue
+            if re.match(r"^[\$£€]\d+", line_s):
+                continue
+            # Skip tour card metadata
+            if line_s in ("Book Now", "Learn More", "Locals Favourite",
+                          "Book Now Learn More", "Show More"):
+                continue
+            if re.match(r"^\d+ stops?$", line_s):
+                continue
+            if re.match(r"^\d+ people max$", line_s):
+                continue
+            if re.match(r"^\d+ - \d", line_s) and "hour" in line_s.lower():
+                continue
+            if line_s.startswith("Based on ") and "review" in line_s:
+                continue
+            if line_s.startswith("Review: "):
+                continue
+            cleaned_lines.append(line)
+        text = "\n".join(cleaned_lines).strip()
+        if text:
+            sections.append(markdown_to_html(text))
 
     # List of tours in this city
     if tour_pages:
