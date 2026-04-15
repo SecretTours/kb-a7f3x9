@@ -813,7 +813,6 @@ def generate_tour_page(page: dict, th_data: dict = None) -> str:
         if idx > 0:
             text = text[:idx].strip()
     body_html = markdown_to_html(text)
-    links_html = generate_links_section(page.get("internal_links", []))
 
     # TicketingHub: pricing, availability, and booking link
     th_html = ""
@@ -833,7 +832,7 @@ def generate_tour_page(page: dict, th_data: dict = None) -> str:
         f'<a data-external="true" href="{booking_url}" target="_blank" '
         f'style="background:#ff5a5f;color:white;padding:12px 32px;'
         f'text-decoration:none;border-radius:4px;font-size:16px;font-weight:bold;">'
-        f'Book This Tour</a></p>'
+        f'Book This Tour on secretfoodtours.com</a></p>'
     )
 
     body = f"""
@@ -841,9 +840,6 @@ def generate_tour_page(page: dict, th_data: dict = None) -> str:
     {body_html}
     {th_html}
     {booking_html}
-    <hr>
-    <p><small>Source: <a href="{page['url']}">{page['url']}</a></small></p>
-    {links_html}
     """
     return wrap_page(title, body, breadcrumb)
 
@@ -854,17 +850,22 @@ def generate_city_page(city: str, city_page: dict, tour_pages: list) -> str:
 
     breadcrumb = f'<p><a href="{BASE_PATH}/">Home</a></p>'
 
-    sections = [f"<h1>{city_display} Food Tours</h1>"]
+    sections = [f"<h1>{city_display}</h1>"]
 
     # City overview content if we have a city page
     if city_page:
         text = city_page["text"]
         text = re.sub(r"^#+ .+\n*", "", text, count=1).strip()
+        # Strip everything after known section markers to keep it short
+        for marker in SECTION_CUT_MARKERS:
+            idx = text.find(marker)
+            if idx > 0:
+                text = text[:idx].strip()
         sections.append(markdown_to_html(text))
 
     # List of tours in this city
     if tour_pages:
-        sections.append("<h2>Available Tours</h2>")
+        sections.append("<h2>Tours</h2>")
         sections.append('<ul class="tour-list">')
         for tp in sorted(tour_pages, key=lambda x: x["title"]):
             parts = get_url_parts(tp["url"])
@@ -874,7 +875,7 @@ def generate_city_page(city: str, city_page: dict, tour_pages: list) -> str:
         sections.append("</ul>")
 
     body = "\n".join(sections)
-    return wrap_page(f"{city_display} Food Tours", body, breadcrumb)
+    return wrap_page(city_display, body, breadcrumb)
 
 
 def generate_index_page(cities: dict, general_pages: list) -> str:
@@ -924,14 +925,10 @@ def generate_general_page(page: dict) -> str:
         if idx > 0:
             text = text[:idx].strip()
     body_html = markdown_to_html(text)
-    links_html = generate_links_section(page.get("internal_links", []))
 
     body = f"""
     <h1>{escape_html(page['title'])}</h1>
     {body_html}
-    {links_html}
-    <hr>
-    <p><small>Source: <a href="{page['url']}">{page['url']}</a></small></p>
     """
     return wrap_page(page["title"], body, breadcrumb)
 
