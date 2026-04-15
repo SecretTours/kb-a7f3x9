@@ -778,6 +778,7 @@ GENERIC_TITLES = {
     "about the tour", "sobre el tour", "meet the best",
     "see itinerary", "book your tour", "book now", "faq",
     "frequently asked questions", "ready to taste",
+    "the food", "the drinks",
 }
 
 
@@ -830,8 +831,10 @@ def generate_tour_page(page: dict, th_data: dict = None) -> str:
     body_html = markdown_to_html(text)
 
     # TicketingHub: pricing, availability, and booking link
+    # Skip availability for upgrade packages (drinks upgrades etc.)
+    is_upgrade = "upgrade" in page["url"].lower()
     th_html = ""
-    if th_data:
+    if th_data and not is_upgrade:
         matched_pid = match_tour_to_product(page["url"], title, th_data)
         if matched_pid:
             product = th_data[matched_pid]
@@ -917,11 +920,12 @@ def generate_city_page(city: str, city_page: dict, tour_pages: list) -> str:
     if tour_pages:
         sections.append("<h2>Tours</h2>")
         sections.append('<ul class="tour-list">')
-        for tp in sorted(tour_pages, key=lambda x: x["title"]):
+        for tp in sorted(tour_pages, key=lambda x: derive_tour_title(x["title"], x["url"])):
             parts = get_url_parts(tp["url"])
             tour_slug = parts[1] if len(parts) >= 2 else ""
             link = f"{BASE_PATH}/{city}/{tour_slug}/"
-            sections.append(f'<li><a href="{link}">{escape_html(tp["title"])}</a></li>')
+            tour_title = derive_tour_title(tp["title"], tp["url"])
+            sections.append(f'<li><a href="{link}">{escape_html(tour_title)}</a></li>')
         sections.append("</ul>")
 
     body = "\n".join(sections)
