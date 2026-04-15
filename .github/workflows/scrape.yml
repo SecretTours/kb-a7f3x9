@@ -48,9 +48,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
           git add -f scraped_pages.json
           git diff --cached --quiet || git commit -m "Update scraped pages cache [skip ci]"
-          git push
+          git push || (git pull --rebase origin main && git push)
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
