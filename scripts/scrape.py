@@ -347,6 +347,18 @@ def match_tour_to_product(tour_url: str, tour_title: str, th_data: dict):
         if "cooking" not in tour_types and ("class" in pname or "making" in pname):
             score -= 5
 
+        # Language matching: Spanish product names for English pages (and vice versa)
+        is_spanish_page = norm_slug.endswith(" es")
+        spanish_indicators = ["tour gastronomico", "pasteleria", "chocolateria",
+                            "ciudad de mexico", "nueva york"]
+        p_is_spanish = any(ind in pname for ind in spanish_indicators)
+        if is_spanish_page and p_is_spanish:
+            score += 3  # Spanish page + Spanish product = good
+        elif not is_spanish_page and p_is_spanish:
+            score -= 4  # English page + Spanish product = bad
+        elif is_spanish_page and not p_is_spanish:
+            score -= 4  # Spanish page + English product = bad
+
         if score > best_score:
             best_score = score
             best_match = pid
@@ -376,43 +388,57 @@ def generate_availability_html(product: dict) -> str:
             )
         sections.append('</table>')
 
-    # Availability calendar
+    # Availability calendar — one row per time slot
     avail = product.get("availability", {})
     if avail:
         sections.append('<h2>Upcoming Availability</h2>')
         sections.append('<table style="border-collapse:collapse;width:100%;max-width:600px;">')
         sections.append('<tr style="border-bottom:2px solid #c49959;">'
                        '<th style="text-align:left;padding:6px;">Date</th>'
-                       '<th style="text-align:center;padding:6px;">Status</th>'
-                       '<th style="text-align:left;padding:6px;">Times</th>'
+                       '<th style="text-align:left;padding:6px;">Time</th>'
+                       '<th style="text-align:center;padding:6px;">Capacity</th>'
+                       '<th style="text-align:center;padding:6px;">Booked</th>'
                        '<th style="text-align:right;padding:6px;">Spots Left</th></tr>')
 
         for date_str in sorted(avail.keys()):
             day = avail[date_str]
-            status = day["status"]
-            if status == "OPEN":
-                status_html = '<span style="color:#2e7d32;">&#9679; Open</span>'
-                times_list = []
-                for t, info in sorted(day["times"].items()):
-                    if info["capacity"] > 0:
-                        remaining = info["capacity"] - info["booked"]
-                        times_list.append(t)
-                times_html = ", ".join(times_list) if times_list else "-"
-                spots = day["remaining"]
-                spots_html = f'{spots}' if spots > 3 else f'<strong style="color:#c62828;">{spots} (limited)</strong>'
-            else:
-                status_html = '<span style="color:#c62828;">&#9679; Closed</span>'
-                times_html = "-"
-                spots_html = "0"
+            # Filter to active time slots (capacity > 0)
+            active_times = {t: info for t, info in day["times"].items()
+                          if info["capacity"] > 0}
 
-            sections.append(
-                f'<tr style="border-bottom:1px solid #eee;">'
-                f'<td style="padding:6px;">{date_str}</td>'
-                f'<td style="text-align:center;padding:6px;">{status_html}</td>'
-                f'<td style="padding:6px;">{times_html}</td>'
-                f'<td style="text-align:right;padding:6px;">{spots_html}</td>'
-                f'</tr>'
-            )
+            if not active_times:
+                # All slots closed — show one row
+                sections.append(
+                    f'<tr style="border-bottom:1px solid #eee;color:#999;">'
+                    f'<td style="padding:6px;">{date_str}</td>'
+                    f'<td style="padding:6px;" colspan="4">'
+                    f'<span style="color:#c62828;">&#9679; Closed</span></td>'
+                    f'</tr>'
+                )
+                continue
+
+            first_row = True
+            for t, info in sorted(active_times.items()):
+                remaining = info["capacity"] - info["booked"]
+                if remaining <= 0:
+                    spots_html = '<strong style="color:#c62828;">Sold out</strong>'
+                elif remaining <= 3:
+                    spots_html = f'<strong style="color:#c62828;">{remaining} (limited!)</strong>'
+                else:
+                    spots_html = str(remaining)
+
+                date_cell = date_str if first_row else ""
+                sections.append(
+                    f'<tr style="border-bottom:1px solid #eee;">'
+                    f'<td style="padding:6px;">{date_cell}</td>'
+                    f'<td style="padding:6px;">{t}</td>'
+                    f'<td style="text-align:center;padding:6px;">{info["capacity"]}</td>'
+                    f'<td style="text-align:center;padding:6px;">{info["booked"]}</td>'
+                    f'<td style="text-align:right;padding:6px;">{spots_html}</td>'
+                    f'</tr>'
+                )
+                first_row = False
+
         sections.append('</table>')
     elif product["tiers"]:
         # Has pricing but no availability data
